@@ -45,6 +45,186 @@ python generate.py --prompt "To build" --max_new_tokens 200
 
 如果你在 Apple Silicon 上，默认会自动尝试使用 `mps`；有 NVIDIA GPU 时会自动使用 `cuda`；否则使用 `cpu`。
 
+## 从 0 跑通完整流程
+
+下面这些命令可以按顺序执行。每一步都对应 LLM 训练/推理链路里的一个环节。
+
+### 1. 获取代码
+
+如果你是在自己的电脑上重新拉取项目：
+
+```bash
+git clone git@github.com:ScXia0/miniLLM.git
+cd miniLLM
+```
+
+如果你已经在本机当前项目目录里：
+
+```bash
+cd /Users/didi/Documents/miniLLM
+```
+
+### 2. 安装依赖
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+这个项目目前只依赖：
+
+- `torch`：模型、训练、自动求导
+- `numpy`：后续扩展数据处理时会用到
+
+### 3. 做一次最小 smoke test
+
+这一步只训练 1 step，用来确认环境、数据、模型、反向传播、checkpoint 保存都能跑通：
+
+```bash
+python3 train.py \
+  --max_steps 1 \
+  --eval_interval 1 \
+  --eval_iters 1 \
+  --out_dir out/smoke
+```
+
+正常情况下你会看到类似输出：
+
+```text
+device: cpu
+vocab_size: 100
+train tokens: ...
+parameters: ...
+step     1/1 | train ... | val ... | lr ... | ...
+saved checkpoint to out/smoke/model.pt
+```
+
+这里的 loss 不重要，因为只训练了一步。重要的是整条链路没有报错。
+
+### 4. 用 smoke checkpoint 生成文本
+
+```bash
+python3 generate.py \
+  --checkpoint out/smoke/model.pt \
+  --tokenizer out/smoke/tokenizer.json \
+  --prompt "To build" \
+  --max_new_tokens 100
+```
+
+只训练 1 step 时，输出大概率是随机字符。这是正常的，因为模型还没学到足够模式。
+
+### 5. 训练一个稍微能看出模式的玩具模型
+
+```bash
+python3 train.py \
+  --max_steps 300 \
+  --block_size 64 \
+  --batch_size 16 \
+  --n_layer 4 \
+  --n_head 4 \
+  --n_embd 128 \
+  --out_dir out/demo
+```
+
+参数含义：
+
+- `--max_steps`：训练多少步
+- `--block_size`：上下文长度，也就是每次看多少个 token
+- `--batch_size`：每步训练多少段文本
+- `--n_layer`：Transformer block 层数
+- `--n_head`：attention head 数量
+- `--n_embd`：每个 token 的向量维度
+- `--out_dir`：checkpoint 和 tokenizer 保存目录
+
+### 6. 用训练好的 demo 模型生成
+
+```bash
+python3 generate.py \
+  --checkpoint out/demo/model.pt \
+  --tokenizer out/demo/tokenizer.json \
+  --prompt "To build" \
+  --max_new_tokens 300 \
+  --temperature 0.8 \
+  --top_k 20
+```
+
+生成参数含义：
+
+- `--prompt`：起始文本
+- `--max_new_tokens`：最多生成多少个新 token
+- `--temperature`：采样随机性，越低越保守，越高越发散
+- `--top_k`：只从概率最高的 k 个 token 里采样
+
+### 7. 换成你自己的训练语料
+
+准备一个纯文本文件，例如：
+
+```text
+data/my_corpus.txt
+```
+
+然后运行：
+
+```bash
+python3 train.py \
+  --data_path data/my_corpus.txt \
+  --max_steps 1000 \
+  --block_size 128 \
+  --batch_size 32 \
+  --out_dir out/my-corpus
+```
+
+注意：语料要明显长于 `block_size`，否则无法切出训练和验证 batch。数据越少，模型越容易背诵；数据越干净，loss 和生成效果越稳定。
+
+### 8. 查看训练产物
+
+```bash
+ls -lh out/demo
+```
+
+训练目录里通常会有：
+
+```text
+model.pt          # 模型参数和配置
+tokenizer.json    # 字符到 token id 的映射
+metadata.json     # 最后一次 loss、模型配置等信息
+```
+
+### 9. 常用调试命令
+
+检查 Python 文件是否有语法错误：
+
+```bash
+python3 -m py_compile train.py generate.py minillm/*.py
+```
+
+强制使用 CPU：
+
+```bash
+python3 train.py --device cpu --max_steps 10
+```
+
+如果你在 Apple Silicon 上想指定 MPS：
+
+```bash
+python3 train.py --device mps --max_steps 300
+```
+
+如果你有 NVIDIA GPU：
+
+```bash
+python3 train.py --device cuda --max_steps 300
+```
+
+### 10. 一条命令快速复现
+
+想快速从训练到生成，可以依次执行：
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 train.py --max_steps 300 --block_size 64 --batch_size 16 --out_dir out/demo
+python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenizer.json --prompt "To build" --max_new_tokens 200
+```
+
 ## 核心概念
 
 ### 1. Tokenizer
@@ -170,4 +350,3 @@ out/
 10. 写一个 C 或 C++ 推理器，理解权重导出和部署
 
 这条路线会从 nanoGPT 逐渐走向 LLaMA-style mini model，也会覆盖很多面试里常问的 LLM 工程点。
-
