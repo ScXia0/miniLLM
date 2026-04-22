@@ -1,0 +1,33 @@
+To build a language model, we teach it a very simple game:
+look at the previous tokens, then guess the next token.
+
+At first the model knows nothing.
+It sees characters, it makes mistakes, and the loss is high.
+After many updates, the model begins to notice patterns:
+spaces often follow words, periods often end sentences,
+and a question may invite an answer.
+
+This tiny corpus is not enough to make a wise assistant.
+It is only a small playground for understanding the machine.
+The important lesson is the full loop:
+text becomes tokens,
+tokens become tensors,
+tensors flow through attention,
+attention mixes context,
+the model predicts logits,
+the loss measures surprise,
+and gradients adjust the weights.
+
+中文也可以进入这个小语料。
+模型不会真正理解世界，
+但它会学习字符之间的统计规律。
+如果你给它更多干净的数据、更大的模型和更长的训练时间，
+它就会逐渐从玩具实验走向更真实的语言模型。
+
+Interview notes:
+causal attention prevents future leakage.
+embeddings turn token ids into vectors.
+the optimizer changes weights using gradients.
+validation loss tells us whether the model generalizes.
+sampling turns probabilities back into text.
+
