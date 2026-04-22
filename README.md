@@ -119,6 +119,7 @@ python3 train.py \
   --max_steps 300 \
   --block_size 64 \
   --batch_size 16 \
+  --gradient_accumulation_steps 2 \
   --n_layer 4 \
   --n_head 4 \
   --n_embd 128 \
@@ -129,11 +130,20 @@ python3 train.py \
 
 - `--max_steps`：训练多少步
 - `--block_size`：上下文长度，也就是每次看多少个 token
-- `--batch_size`：每步训练多少段文本
+- `--batch_size`：每个 microbatch 训练多少段文本
+- `--gradient_accumulation_steps`：累积多少个 microbatch 后再更新一次参数
 - `--n_layer`：Transformer block 层数
 - `--n_head`：attention head 数量
 - `--n_embd`：每个 token 的向量维度
 - `--out_dir`：checkpoint 和 tokenizer 保存目录
+
+有效 batch token 数可以这样理解：
+
+```text
+effective_batch_tokens = batch_size * block_size * gradient_accumulation_steps
+```
+
+这是真实 LLM 训练里很重要的概念：显存不够时，不一定要直接增大 `batch_size`，也可以用梯度累积模拟更大的 batch。
 
 ### 6. 用训练好的 demo 模型生成
 
@@ -170,6 +180,7 @@ python3 train.py \
   --max_steps 1000 \
   --block_size 128 \
   --batch_size 32 \
+  --gradient_accumulation_steps 4 \
   --out_dir out/my-corpus
 ```
 
@@ -206,13 +217,13 @@ python3 train.py --device cpu --max_steps 10
 如果你在 Apple Silicon 上想指定 MPS：
 
 ```bash
-python3 train.py --device mps --max_steps 300
+python3 train.py --device mps --dtype float16 --max_steps 300
 ```
 
 如果你有 NVIDIA GPU：
 
 ```bash
-python3 train.py --device cuda --max_steps 300
+python3 train.py --device cuda --dtype auto --max_steps 300
 ```
 
 ### 10. 一条命令快速复现
@@ -221,7 +232,7 @@ python3 train.py --device cuda --max_steps 300
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 train.py --max_steps 300 --block_size 64 --batch_size 16 --out_dir out/demo
+python3 train.py --max_steps 300 --block_size 64 --batch_size 16 --gradient_accumulation_steps 2 --out_dir out/demo
 python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenizer.json --prompt "To build" --max_new_tokens 200
 ```
 
@@ -315,6 +326,49 @@ prompt -> 预测 next token -> 拼回输入 -> 再预测下一个 token -> ...
 - 高 temperature：更随机，更发散
 
 `top_k` 只允许模型从概率最高的 k 个 token 中采样，可以减少很离谱的输出。
+
+### 6. 训练优化
+
+文件：`train.py`
+
+当前训练脚本已经加入了几个真实 LLM 训练里常见的优化点。
+
+**Gradient Accumulation**
+
+如果显存不够，不能直接把 `batch_size` 调大，就可以连续跑多个 microbatch，只累积梯度，最后再更新一次参数：
+
+```text
+microbatch 1 -> backward, 不 step
+microbatch 2 -> backward, 不 step
+microbatch 3 -> backward, 不 step
+microbatch 4 -> backward, optimizer.step()
+```
+
+这样可以模拟更大的 batch。代码里用 `--gradient_accumulation_steps` 控制。
+
+**Mixed Precision**
+
+在 GPU 或 Apple Silicon 上，部分计算可以使用 `float16` 或 `bfloat16`：
+
+```bash
+python3 train.py --device cuda --dtype auto
+python3 train.py --device mps --dtype float16
+```
+
+混合精度通常可以减少显存占用、提升吞吐。CPU 路径默认保持 `float32`，方便学习和调试。
+
+**AdamW 参数分组**
+
+训练脚本会把参数分成两类：
+
+- 大矩阵权重：使用 weight decay
+- bias 和 norm 参数：不使用 weight decay
+
+这是很多 LLM 训练 recipe 中常见的写法，比对所有参数一刀切更合理。
+
+**Tokens/sec**
+
+训练日志里会显示 `tok/s`，也就是每秒处理多少 token。相比只看 step 时间，tokens/sec 更适合比较不同 batch size、context length 和模型大小下的训练效率。
 
 ## 训练产物
 
