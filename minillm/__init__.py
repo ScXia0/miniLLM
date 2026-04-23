@@ -1,2 +1,1 @@
-"""A tiny, readable GPT-style language model package."""
-
+"""一个小而可读的 GPT/LLaMA 风格语言模型包。"""

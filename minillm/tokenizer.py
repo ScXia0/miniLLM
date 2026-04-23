@@ -1,9 +1,8 @@
-"""A deliberately simple character-level tokenizer.
+"""一个刻意保持简单的字符级 tokenizer。
 
-Real LLMs usually use BPE/Unigram tokenizers because they compress text much
-better than raw characters. For a from-zero implementation, a char tokenizer is
-perfect for the first milestone: it makes tokenization transparent, keeps the
-model small, and lets us focus on the Transformer training loop.
+真实 LLM 通常使用 BPE 或 Unigram tokenizer，因为它们能把文本压缩成更短的
+token 序列，训练和推理都更省。这里先用字符级 tokenizer，是为了让“文本如何
+变成整数”完全透明，把注意力放在 Transformer 训练主流程上。
 """
 
 from __future__ import annotations
@@ -15,14 +14,14 @@ from pathlib import Path
 
 @dataclass
 class CharTokenizer:
-    """Map characters to integer token ids and back again.
+    """把字符映射成整数 token id，也能把整数 id 还原成字符。
 
-    The tokenizer owns two lookup tables:
-    - stoi: string/character -> integer id
-    - itos: integer id -> string/character
+    这里维护两张查表：
+    - stoi: string to integer，字符 -> 整数 id
+    - itos: integer to string，整数 id -> 字符
 
-    We reserve id 0 for unknown characters so generation prompts do not crash if
-    the user types a character that was not present in the training corpus.
+    id 0 保留给未知字符。如果生成时 prompt 里出现训练语料没见过的字符，
+    程序不会直接报错，而是映射到这个未知 token。
     """
 
     stoi: dict[str, int]
@@ -31,7 +30,7 @@ class CharTokenizer:
 
     @classmethod
     def train(cls, text: str) -> "CharTokenizer":
-        """Build a vocabulary from all unique characters in the corpus."""
+        """从语料里出现过的所有字符构建词表。"""
 
         chars = sorted(set(text))
         stoi = {"<unk>": 0}
@@ -42,22 +41,21 @@ class CharTokenizer:
 
     @property
     def vocab_size(self) -> int:
-        """Number of tokens the model must be able to predict."""
+        """词表大小，也就是模型最终分类头需要预测的类别数。"""
 
         return len(self.stoi)
 
     def encode(self, text: str) -> list[int]:
-        """Turn text into token ids.
+        """把文本转换成 token id 列表。
 
-        Unknown characters are mapped to 0 instead of raising an error. This is
-        friendly for demos, and it mirrors the idea of special fallback tokens in
-        production tokenizers.
+        未知字符会映射到 0，而不是直接抛异常。这对 demo 更友好，也对应了
+        工业 tokenizer 里常见的特殊兜底 token。
         """
 
         return [self.stoi.get(ch, 0) for ch in text]
 
     def decode(self, ids: list[int]) -> str:
-        """Turn token ids back into text."""
+        """把 token id 列表还原成文本。"""
 
         pieces = []
         for token_id in ids:
@@ -66,7 +64,7 @@ class CharTokenizer:
         return "".join(pieces)
 
     def save(self, path: str | Path) -> None:
-        """Persist the vocabulary as JSON so training and generation agree."""
+        """把词表保存成 JSON，确保训练和生成使用同一套映射。"""
 
         path = Path(path)
         payload = {
@@ -77,11 +75,10 @@ class CharTokenizer:
 
     @classmethod
     def load(cls, path: str | Path) -> "CharTokenizer":
-        """Load a tokenizer created by :meth:`save`."""
+        """加载由 save 方法保存的 tokenizer。"""
 
         path = Path(path)
         payload = json.loads(path.read_text(encoding="utf-8"))
         stoi = {str(ch): int(i) for ch, i in payload["stoi"].items()}
         itos = {i: ch for ch, i in stoi.items()}
         return cls(stoi=stoi, itos=itos, unk_token=payload.get("unk_token", "<unk>"))
-

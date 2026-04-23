@@ -1,4 +1,4 @@
-"""Small helpers for next-token language-model training."""
+"""next-token 语言模型训练所需的小工具。"""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import torch
 
 
 def read_text(path: str | Path) -> str:
-    """Read a UTF-8 text corpus from disk."""
+    """从磁盘读取 UTF-8 文本语料。"""
 
     return Path(path).read_text(encoding="utf-8")
 
 
 def split_train_val(ids: list[int], val_fraction: float = 0.1) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split token ids into train and validation tensors."""
+    """把 token id 序列切成训练集和验证集。"""
 
     if not 0 < val_fraction < 1:
         raise ValueError("val_fraction must be between 0 and 1")
@@ -28,7 +28,7 @@ def split_train_val(ids: list[int], val_fraction: float = 0.1) -> tuple[torch.Te
 
 @dataclass
 class BatchConfig:
-    """Shape information for random next-token batches."""
+    """随机采样 batch 时需要的形状和设备配置。"""
 
     batch_size: int
     block_size: int
@@ -36,14 +36,14 @@ class BatchConfig:
 
 
 def get_batch(data: torch.Tensor, cfg: BatchConfig) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample a batch of input/target sequences.
+    """随机采样一批输入序列 x 和目标序列 y。
 
-    For language modeling, the target is the input shifted one token to the left:
+    对 next-token prediction 来说，目标 y 就是输入 x 向左平移一个 token：
 
         x = [t0, t1, t2, ...]
         y = [t1, t2, t3, ...]
 
-    This trains the model to predict the next token at every position.
+    这样模型在每个位置都要学习“根据当前位置及之前的上下文预测下一个 token”。
     """
 
     if len(data) <= cfg.block_size:
@@ -57,4 +57,3 @@ def get_batch(data: torch.Tensor, cfg: BatchConfig) -> tuple[torch.Tensor, torch
     x = torch.stack([data[i : i + cfg.block_size] for i in starts])
     y = torch.stack([data[i + 1 : i + cfg.block_size + 1] for i in starts])
     return x.to(cfg.device), y.to(cfg.device)
-

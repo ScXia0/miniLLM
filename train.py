@@ -1,15 +1,15 @@
-"""Train a tiny GPT-style language model from scratch.
+"""从零训练一个很小的 GPT/LLaMA 风格语言模型。
 
-Run:
+运行示例：
     python train.py --max_steps 500
 
-This script is intentionally compact but complete:
-1. read text
-2. train a tokenizer
-3. create next-token batches
-4. train MiniGPT
-5. evaluate validation loss
-6. save checkpoint + tokenizer
+这个脚本刻意保持短小，但覆盖完整训练流程：
+1. 读取文本
+2. 训练 tokenizer
+3. 构造 next-token batch
+4. 训练 MiniGPT
+5. 评估验证集 loss
+6. 保存 checkpoint 和 tokenizer
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def pick_device(name: str) -> torch.device:
-    """Select a device while keeping CPU as the portable fallback."""
+    """选择训练设备；如果没有 GPU/MPS，就回退到最通用的 CPU。"""
 
     if name == "cuda" or (name == "auto" and torch.cuda.is_available()):
         return torch.device("cuda")
@@ -64,12 +64,11 @@ def pick_device(name: str) -> torch.device:
 
 
 def pick_autocast_dtype(device: torch.device, dtype_name: str) -> tuple[torch.dtype, bool]:
-    """Choose the dtype used by automatic mixed precision.
+    """选择 automatic mixed precision 使用的 dtype。
 
-    Mixed precision is a standard LLM training optimization: some matrix
-    operations run in fp16/bf16 to save memory and improve throughput, while
-    sensitive operations can remain in fp32. CPU training stays in fp32 here so
-    the beginner path remains portable and predictable.
+    mixed precision（混合精度）是 LLM 训练常见优化：部分矩阵计算用 fp16/bf16，
+    可以省显存、提吞吐；对数值更敏感的部分仍可保持 fp32。这里让 CPU 训练保持
+    fp32，保证初学路径最稳定。
     """
 
     if dtype_name == "float32" or device.type == "cpu":
@@ -81,13 +80,13 @@ def pick_autocast_dtype(device: torch.device, dtype_name: str) -> tuple[torch.dt
     if device.type == "cuda":
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, True
     if device.type == "mps":
-        # Apple Silicon generally handles float16 autocast better than bfloat16.
+        # Apple Silicon 的 autocast 通常对 float16 支持更稳。
         return torch.float16, True
     return torch.float32, False
 
 
 def autocast_context(device: torch.device, dtype: torch.dtype, enabled: bool) -> ContextManager:
-    """Return an autocast context manager or a no-op context manager."""
+    """返回 autocast 上下文；不开启混合精度时返回空操作上下文。"""
 
     if not enabled:
         return nullcontext()
@@ -95,11 +94,11 @@ def autocast_context(device: torch.device, dtype: torch.dtype, enabled: bool) ->
 
 
 def build_optimizer(model: MiniGPT, learning_rate: float, weight_decay: float) -> torch.optim.Optimizer:
-    """Create AdamW with LLM-style weight-decay parameter groups.
+    """创建带 LLM 常见参数分组的 AdamW 优化器。
 
-    Large matrix weights benefit from weight decay, but biases and normalization
-    parameters usually do not. Splitting them mirrors the optimizer setup used in
-    many production LLM training recipes and is a useful interview detail.
+    weight decay 是权重衰减，用来抑制参数过大，起到正则化作用。大矩阵权重通常
+    使用 weight decay；bias 和 norm 参数通常不使用。很多工业 LLM 训练 recipe
+    都会这样分组，这是一个很常见的面试点。
     """
 
     decay_params = []
@@ -120,7 +119,7 @@ def build_optimizer(model: MiniGPT, learning_rate: float, weight_decay: float) -
 
 
 def architecture_options(name: str) -> dict[str, str | float]:
-    """Translate a friendly architecture name into model component choices."""
+    """把友好的架构名翻译成具体模型组件选择。"""
 
     if name == "gpt":
         return {
@@ -140,7 +139,7 @@ def architecture_options(name: str) -> dict[str, str | float]:
 
 
 def cosine_lr(step: int, max_steps: int, base_lr: float) -> float:
-    """A tiny cosine schedule: high learning rate early, gentle decay later."""
+    """cosine learning rate schedule：前期学习率较高，后期按余弦曲线平滑衰减。"""
 
     progress = step / max(1, max_steps)
     return 0.1 * base_lr + 0.9 * base_lr * 0.5 * (1 + math.cos(math.pi * progress))
@@ -156,7 +155,7 @@ def estimate_loss(
     amp_dtype: torch.dtype,
     use_amp: bool,
 ) -> dict[str, float]:
-    """Estimate train/validation loss from several random batches."""
+    """用多个随机 batch 估计 train/validation loss。"""
 
     model.eval()
     losses = {}
@@ -245,15 +244,17 @@ def main() -> None:
             with autocast_context(device, amp_dtype, use_amp):
                 _, loss = model(x, y)
                 assert loss is not None
-                # Dividing by accumulation steps keeps the final gradient scale
-                # equivalent to using one large batch instead of many microbatches.
+                # gradient accumulation（梯度累积）会把多个 microbatch 的梯度累加
+                # 后再更新一次参数。这里除以累积步数，是为了让最终梯度尺度等价于
+                # 直接使用一个更大的 batch。
                 scaled_loss = loss / args.gradient_accumulation_steps
 
             micro_losses.append(loss.item())
             scaler.scale(scaled_loss).backward()
 
-        # Gradients must be unscaled before clipping, otherwise the clipping
-        # threshold would be applied to artificially enlarged fp16 gradients.
+        # mixed precision 下，GradScaler 可能会放大梯度以避免 fp16 下溢。
+        # 做 gradient clipping（梯度裁剪）前必须先 unscale，否则裁剪阈值会作用在
+        # 被人为放大的梯度上。
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)

@@ -1,9 +1,8 @@
-"""A compact decoder-only Transformer with GPT-style and LLaMA-style options.
+"""一个紧凑的 decoder-only Transformer，支持 GPT-style 和 LLaMA-style 配置。
 
-This file intentionally keeps the architecture explicit. The goal is not to
-hide complexity behind a framework, but to expose the exact components that show
-up in GPT-like LLMs: token embeddings, positional embeddings, causal attention,
-MLP blocks, residual connections, normalization, and next-token loss.
+这个文件刻意把模型结构写得比较直白，不把复杂度藏在框架后面。你可以在这里
+直接看到 GPT/LLaMA 类模型常见的组成部分：token embedding、位置编码、
+causal attention、MLP、残差连接、归一化层，以及 next-token loss。
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ import torch.nn.functional as F
 
 @dataclass
 class GPTConfig:
-    """Hyperparameters that define the model size and context length."""
+    """模型大小、上下文长度和结构风格的超参数。"""
 
     vocab_size: int
     block_size: int = 128
@@ -32,12 +31,11 @@ class GPTConfig:
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square LayerNorm, used by LLaMA-style models.
+    """RMSNorm，Root Mean Square Normalization，LLaMA 风格模型常用的归一化层。
 
-    LayerNorm subtracts the mean and divides by the standard deviation. RMSNorm
-    skips the mean subtraction and normalizes by root mean square instead. It is
-    a little simpler, a little cheaper, and widely used in modern decoder-only
-    LLMs such as LLaMA.
+    LayerNorm 会先减均值，再除以标准差；RMSNorm 不减均值，只用 root mean
+    square，也就是均方根做归一化。它结构更简单、计算略省，在 LLaMA 等现代
+    decoder-only LLM 中很常见。
     """
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
@@ -46,14 +44,14 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute the normalization in fp32 for numerical stability, then cast
-        # back to the incoming dtype so mixed precision still saves memory.
+        # 为了数值稳定，归一化统计量用 fp32 计算；最后再转回输入 dtype，
+        # 这样 mixed precision 仍然能节省显存。
         normed = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return self.weight.to(dtype=x.dtype) * normed.to(dtype=x.dtype)
 
 
 def build_norm(config: GPTConfig) -> nn.Module:
-    """Create the normalization layer selected by the config."""
+    """根据配置创建归一化层。"""
 
     if config.norm_type == "layernorm":
         return nn.LayerNorm(config.n_embd)
@@ -63,14 +61,14 @@ def build_norm(config: GPTConfig) -> nn.Module:
 
 
 def apply_rope(q: torch.Tensor, k: torch.Tensor, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply Rotary Position Embeddings to query and key tensors.
+    """把 RoPE 应用到 query 和 key 上。
 
-    RoPE rotates pairs of hidden dimensions by an angle that depends on token
-    position. Unlike learned absolute position embeddings, RoPE injects position
-    information inside attention itself, which is why it appears in many modern
-    LLaMA-style architectures.
+    RoPE 是 Rotary Position Embedding，中文常叫“旋转位置编码”。它会按 token
+    位置给 query/key 的成对维度做旋转。和 learned absolute position embedding
+    不同，RoPE 不是把位置向量直接加到 token embedding 上，而是把位置信息注入
+    attention 的 q/k 计算里，因此在 LLaMA 风格架构中很常见。
 
-    Input shapes:
+    输入形状：
         q, k: (B, n_head, T, head_dim)
     """
 
@@ -95,12 +93,11 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, theta: float) -> tuple[torch.Te
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head self-attention with a causal mask.
+    """带 causal mask 的多头自注意力。
 
-    "Causal" means token position i may only attend to positions <= i. This is
-    the key restriction that makes a decoder-only Transformer usable for
-    autoregressive text generation: during training, we can process all positions
-    in parallel while preventing information leakage from the future.
+    causal 的意思是：第 i 个 token 只能看见位置 <= i 的 token，不能偷看未来。
+    这是 decoder-only Transformer 可以做自回归生成的关键限制。训练时我们仍然
+    能并行计算整段序列，但 causal mask 会阻止未来信息泄漏。
     """
 
     def __init__(self, config: GPTConfig) -> None:
@@ -115,14 +112,15 @@ class CausalSelfAttention(nn.Module):
         if self.use_rope and self.head_dim % 2 != 0:
             raise ValueError("RoPE requires n_embd / n_head to be even")
 
-        # One projection produces q, k, and v together for efficiency.
+        # 为了效率，用一个线性层同时生成 q/k/v。
+        # q = query 查询向量，k = key 键向量，v = value 值向量。
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-        # The lower-triangular mask is stored as a buffer: it is part of the
-        # module state, moves with .to(device), but is not a trainable parameter.
+        # 下三角 causal mask 存成 buffer：它会跟着模型移动到对应 device，
+        # 但不是可训练参数，不会被优化器更新。
         mask = torch.tril(torch.ones(config.block_size, config.block_size))
         self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size))
 
@@ -131,8 +129,9 @@ class CausalSelfAttention(nn.Module):
 
         q, k, v = self.c_attn(x).split(embd, dim=2)
 
-        # Shape convention:
+        # 形状约定：
         # (B, T, C) -> (B, T, n_head, head_dim) -> (B, n_head, T, head_dim)
+        # B=batch size，T=序列长度，C=embedding 维度。
         q = q.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
@@ -140,14 +139,14 @@ class CausalSelfAttention(nn.Module):
         if self.use_rope:
             q, k = apply_rope(q, k, self.rope_theta)
 
-        # Attention scores are scaled dot products between queries and keys.
-        # Dividing by sqrt(head_dim) keeps logits numerically well-behaved.
+        # attention score 是 query 和 key 的缩放点积。
+        # 除以 sqrt(head_dim) 可以避免 logits 过大，让 softmax 更稳定。
         scores = (q @ k.transpose(-2, -1)) * (self.head_dim**-0.5)
         scores = scores.masked_fill(self.causal_mask[:, :, :seq_len, :seq_len] == 0, float("-inf"))
         weights = F.softmax(scores, dim=-1)
         weights = self.attn_dropout(weights)
 
-        # Weighted sum of values, then merge all heads back into one embedding.
+        # 用注意力权重对 value 做加权求和，然后把多个 head 合并回一个 embedding。
         out = weights @ v
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, embd)
         out = self.resid_dropout(self.c_proj(out))
@@ -155,7 +154,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """The feed-forward part of a Transformer block."""
+    """Transformer block 里的前馈网络，也就是 attention 后面的 MLP。"""
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
@@ -168,10 +167,11 @@ class MLP(nn.Module):
                 nn.Dropout(config.dropout),
             )
         elif config.mlp_type == "swiglu":
-            # SwiGLU is the gated MLP family used by LLaMA. It computes
-            # down_proj(silu(gate_proj(x)) * up_proj(x)). The elementwise gate
-            # gives the MLP a multiplicative interaction, which tends to work
-            # better than a plain GELU feed-forward block at LLM scale.
+            # SwiGLU 是 LLaMA 常用的 gated MLP（门控前馈网络）。
+            # 它大致计算：down_proj(silu(gate_proj(x)) * up_proj(x))。
+            # 这里的 gate 像一个“开关”：先用 SiLU 激活生成门控信号，再和另一条
+            # up projection 分支逐元素相乘。相比普通 GELU MLP，这种乘法交互在
+            # LLM 规模下通常表达能力更强。
             hidden_dim = 4 * config.n_embd
             self.gate_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
             self.up_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
@@ -188,14 +188,14 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    """A pre-norm Transformer block.
+    """一个 pre-norm Transformer block。
 
-    The residual pattern is:
+    残差结构是：
         x = x + attention(layer_norm(x))
         x = x + mlp(layer_norm(x))
 
-    Pre-norm is widely used because it makes optimization more stable than the
-    older post-norm layout when models get deeper.
+    pre-norm 指先归一化再进入 attention/MLP。相比更早的 post-norm，pre-norm
+    在模型变深时通常更稳定，因此现代 decoder-only LLM 中很常见。
     """
 
     def __init__(self, config: GPTConfig) -> None:
@@ -212,7 +212,7 @@ class Block(nn.Module):
 
 
 class MiniGPT(nn.Module):
-    """A small GPT that predicts the next token for every input position."""
+    """一个小型 decoder-only 语言模型，在每个位置预测下一个 token。"""
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
@@ -231,15 +231,14 @@ class MiniGPT(nn.Module):
         self.ln_f = build_norm(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Weight tying: input token embeddings and output classifier weights
-        # share parameters. This reduces parameter count and usually improves LM
-        # quality for small decoder-only models.
+        # Weight tying（权重绑定）：输入 token embedding 和输出分类头共享权重。
+        # 这样既减少参数量，也常常能提升小型语言模型的效果。
         self.lm_head.weight = self.token_embedding.weight
 
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
-        """Initialize weights with the GPT-style small normal distribution."""
+        """使用 GPT 风格的小标准差正态分布初始化权重。"""
 
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -253,15 +252,15 @@ class MiniGPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the model.
+        """执行一次前向传播。
 
-        Args:
-            idx: token ids with shape (B, T)
-            targets: optional next-token ids with shape (B, T)
+        参数：
+            idx: 输入 token id，形状为 (B, T)
+            targets: 可选的目标 token id，形状为 (B, T)
 
-        Returns:
-            logits: unnormalized probabilities with shape (B, T, vocab_size)
-            loss: cross-entropy loss when targets are provided, else None
+        返回：
+            logits: 未归一化的预测分数，形状为 (B, T, vocab_size)
+            loss: 如果传入 targets，则返回 cross entropy loss，否则为 None
         """
 
         batch, seq_len = idx.shape
@@ -284,7 +283,7 @@ class MiniGPT(nn.Module):
 
         loss = None
         if targets is not None:
-            # Cross entropy expects shape (N, C), so flatten B*T positions into N.
+            # Cross entropy 期望输入形状是 (N, C)，所以把 B*T 个位置展平成 N。
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
@@ -297,13 +296,12 @@ class MiniGPT(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
     ) -> torch.Tensor:
-        """Autoregressively append tokens to an existing prompt."""
+        """自回归生成：每次预测一个新 token，并把它拼回上下文继续预测。"""
 
         self.eval()
         for _ in range(max_new_tokens):
-            # The model only supports block_size context tokens. For long prompts,
-            # keep the most recent context, which is also how GPT-style inference
-            # windows are commonly handled.
+            # 模型最多只能看 block_size 个上下文 token。prompt 很长时，只保留
+            # 最近的上下文窗口，这也是 GPT 类模型推理时常见的处理方式。
             idx_cond = idx[:, -self.config.block_size :]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
@@ -319,6 +317,6 @@ class MiniGPT(nn.Module):
         return idx
 
     def num_parameters(self) -> int:
-        """Return the number of trainable parameters."""
+        """返回可训练参数数量。"""
 
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
