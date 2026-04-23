@@ -1,8 +1,28 @@
 """一个刻意保持简单的字符级 tokenizer。
 
-真实 LLM 通常使用 BPE 或 Unigram tokenizer，因为它们能把文本压缩成更短的
-token 序列，训练和推理都更省。这里先用字符级 tokenizer，是为了让“文本如何
-变成整数”完全透明，把注意力放在 Transformer 训练主流程上。
+tokenizer 的作用是把文本切成 token，再把 token 映射成整数 id。模型本身只能
+处理整数/张量，不能直接处理字符串。
+
+真实 LLM 通常使用 BPE 或 Unigram tokenizer：
+
+- BPE，Byte Pair Encoding，字节对编码：
+  从很小的基本单位开始，比如字符或字节，不断统计语料中最常一起出现的相邻
+  片段，并把它们合并成新的 token。例如 "l" + "o" 频繁出现，就可能合并成
+  "lo"；再继续合并出 "low"、"lower" 这类子词。BPE 的直觉是：高频片段应该
+  用一个 token 表示，从而减少序列长度。
+
+- Unigram tokenizer，一元语言模型 tokenizer：
+  先准备一个较大的候选子词表，然后给每个子词一个概率。分词时选择一组最可能
+  生成当前文本的子词组合；训练时会逐步删除贡献较小的子词，留下更紧凑的词表。
+  它的直觉是：分词本身也是一个概率模型，不只是贪心合并。
+
+BPE 和 Unigram 都是 subword tokenizer（子词 tokenizer）：token 既可以是单个
+字符，也可以是常见词片段，甚至是完整单词。它们比纯字符级 tokenizer 更能压缩
+文本，序列更短，训练和推理都更省。
+
+本项目当前用的是 char-level tokenizer（字符级 tokenizer）：每个出现过的字符
+就是一个 token。它压缩率不高，但实现最透明，适合作为从 0 理解 LLM 的第一步：
+你可以清楚看到“文本 -> 字符 -> 整数 id -> 模型输入”的全过程。
 """
 
 from __future__ import annotations
