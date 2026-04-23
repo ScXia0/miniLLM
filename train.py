@@ -26,13 +26,15 @@ import torch
 
 from minillm.data import BatchConfig, get_batch, read_text, split_train_val
 from minillm.model import GPTConfig, MiniGPT
-from minillm.tokenizer import CharTokenizer
+from minillm.tokenizer import train_tokenizer
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train miniLLM")
     parser.add_argument("--data_path", type=str, default="data/sample.txt")
     parser.add_argument("--out_dir", type=str, default="out")
+    parser.add_argument("--tokenizer", type=str, default="char", choices=["char", "bpe"])
+    parser.add_argument("--bpe_vocab_size", type=int, default=256)
     parser.add_argument("--block_size", type=int, default=64)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--n_layer", type=int, default=4)
@@ -185,7 +187,7 @@ def main() -> None:
     amp_dtype, use_amp = pick_autocast_dtype(device, args.dtype)
 
     text = read_text(args.data_path)
-    tokenizer = CharTokenizer.train(text)
+    tokenizer = train_tokenizer(text, args.tokenizer, args.bpe_vocab_size)
     ids = tokenizer.encode(text)
     train_data, val_data = split_train_val(ids, args.val_fraction)
 
@@ -216,6 +218,7 @@ def main() -> None:
     effective_batch_tokens = args.batch_size * args.block_size * args.gradient_accumulation_steps
 
     print(f"device: {device}")
+    print(f"tokenizer: {args.tokenizer}")
     print(f"architecture: {args.architecture}")
     print(
         "components: "
@@ -291,6 +294,8 @@ def main() -> None:
             "amp_dtype": str(amp_dtype),
             "use_amp": use_amp,
             "architecture": args.architecture,
+            "tokenizer": args.tokenizer,
+            "bpe_vocab_size": args.bpe_vocab_size if args.tokenizer == "bpe" else None,
         },
     }
     ckpt_path = out_dir / "model.pt"

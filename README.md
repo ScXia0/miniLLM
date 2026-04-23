@@ -6,12 +6,15 @@
 文本语料 -> tokenizer -> token ids -> batch -> Transformer -> loss -> 反向传播 -> checkpoint -> 自回归生成
 ```
 
-当前版本参考 nanoGPT 的思路，实现了一个 **char-level decoder-only Transformer**。模型支持两种架构配置：
+当前版本参考 nanoGPT 的思路，实现了一个 **decoder-only Transformer**。模型支持两种架构配置：
 
 - `--architecture gpt`：GPT-2 风格，LayerNorm + GELU MLP + learned position embedding
 - `--architecture llama`：LLaMA 风格，RMSNorm + SwiGLU + RoPE
 
-char-level tokenizer 很简单，但好处是透明：你可以直接看到字符如何变成整数，整数如何进入模型，模型又如何预测下一个字符。
+tokenizer 支持两种实现：
+
+- `--tokenizer char`：字符级 tokenizer，每个字符一个 token，最透明
+- `--tokenizer bpe`：教学版 BPE tokenizer，从字符开始合并高频相邻片段，序列更短
 
 ## 文件结构
 
@@ -21,7 +24,7 @@ miniLLM/
 ├── minillm/
 │   ├── data.py              # 读取文本、切分 train/val、构造 next-token batch
 │   ├── model.py             # GPTConfig、CausalSelfAttention、Block、MiniGPT
-│   └── tokenizer.py         # char-level tokenizer
+│   └── tokenizer.py         # CharTokenizer 和 BPETokenizer
 ├── train.py                 # 训练入口
 ├── generate.py              # 文本生成入口
 ├── requirements.txt
@@ -39,7 +42,13 @@ pip install -r requirements.txt
 用默认小语料训练一个玩具模型：
 
 ```bash
-python train.py --architecture gpt --max_steps 300 --block_size 64 --batch_size 16
+python train.py --tokenizer char --architecture gpt --max_steps 300 --block_size 64 --batch_size 16
+```
+
+用 BPE tokenizer 训练一个玩具模型：
+
+```bash
+python train.py --tokenizer bpe --bpe_vocab_size 200 --architecture gpt --max_steps 300 --block_size 32 --batch_size 16
 ```
 
 训练一个 LLaMA-style 玩具模型：
@@ -127,6 +136,7 @@ python3 generate.py \
 
 ```bash
 python3 train.py \
+  --tokenizer char \
   --architecture gpt \
   --max_steps 300 \
   --block_size 64 \
@@ -141,6 +151,8 @@ python3 train.py \
 参数含义：
 
 - `--max_steps`：训练多少步
+- `--tokenizer`：tokenizer 类型，`char` 或 `bpe`
+- `--bpe_vocab_size`：BPE 目标词表大小，只在 `--tokenizer bpe` 时使用
 - `--architecture`：模型结构，`gpt` 或 `llama`
 - `--block_size`：上下文长度，也就是每次看多少个 token
 - `--batch_size`：每个 microbatch 训练多少段文本
@@ -190,6 +202,8 @@ data/my_corpus.txt
 ```bash
 python3 train.py \
   --data_path data/my_corpus.txt \
+  --tokenizer bpe \
+  --bpe_vocab_size 1000 \
   --architecture llama \
   --max_steps 1000 \
   --block_size 128 \
@@ -246,7 +260,7 @@ python3 train.py --device cuda --dtype auto --max_steps 300
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 train.py --architecture llama --max_steps 300 --block_size 64 --batch_size 16 --gradient_accumulation_steps 2 --out_dir out/demo
+python3 train.py --tokenizer bpe --bpe_vocab_size 200 --architecture llama --max_steps 300 --block_size 32 --batch_size 16 --gradient_accumulation_steps 2 --out_dir out/demo
 python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenizer.json --prompt "To build" --max_new_tokens 200
 ```
 
@@ -262,14 +276,49 @@ python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenize
 "hello" -> [token_id_1, token_id_2, ...]
 ```
 
-当前实现是字符级 tokenizer：
+当前实现保留了两个 tokenizer，方便对比。
+
+**CharTokenizer**
 
 - 统计训练语料中出现过的所有字符
 - 给每个字符分配一个整数 id
 - 训练时把文本变成 token id 序列
 - 生成后把 token id 还原成字符串
 
-真实 LLM 常用 BPE、SentencePiece、Unigram 等 tokenizer，因为它们能把文本压缩得更短，训练和推理更省。但 char-level 是理解流程的最好起点。
+示例：
+
+```text
+"hi!"  -> ["h", "i", "!"] -> [2, 3, 1]
+"你好" -> ["你", "好"]     -> [4, 5]
+```
+
+**BPETokenizer**
+
+BPE 会从字符级 token 开始，不断合并语料里最常见的相邻 token pair。
+
+示例：
+
+```text
+训练文本: "low lower lowest"
+
+初始:
+["l", "o", "w", " ", "l", "o", "w", "e", "r", ...]
+
+合并 ("l", "o") -> "lo":
+["lo", "w", " ", "lo", "w", "e", "r", ...]
+
+继续合并 ("lo", "w") -> "low":
+["low", " ", "low", "e", "r", ...]
+```
+
+所以同样是 `"lower"`：
+
+```text
+CharTokenizer: "lower" -> ["l", "o", "w", "e", "r"]
+BPETokenizer:  "lower" -> ["low", "e", "r"] 或 ["low", "er"]
+```
+
+BPE token 数更少，因此训练和推理通常更省。char-level 的优点是实现透明，BPE 的优点是更接近真实 LLM。
 
 ### 2. Next-token Prediction
 
@@ -444,7 +493,7 @@ out/
 
 建议按这个顺序升级：
 
-1. 把 char tokenizer 换成 BPE tokenizer
+1. 把教学版 BPE 升级成 byte-level BPE，减少未知字符问题
 2. 加入 KV cache，让生成更快
 3. 加入 grouped-query attention，理解 GQA/MQA
 4. 加入 LoRA，做参数高效微调

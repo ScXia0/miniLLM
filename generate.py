@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from minillm.model import GPTConfig, MiniGPT
-from minillm.tokenizer import CharTokenizer
+from minillm.tokenizer import load_tokenizer
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,7 +48,7 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state"])
 
     # tokenizer 必须和训练时一致，否则同一个 token id 会对应不同字符。
-    tokenizer = CharTokenizer.load(Path(args.tokenizer))
+    tokenizer = load_tokenizer(Path(args.tokenizer))
     prompt_ids = tokenizer.encode(args.prompt)
     x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
