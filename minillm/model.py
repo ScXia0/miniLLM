@@ -60,13 +60,22 @@ def build_norm(config: GPTConfig) -> nn.Module:
     raise ValueError(f"unknown norm_type: {config.norm_type}")
 
 
-def apply_rope(q: torch.Tensor, k: torch.Tensor, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    theta: float,
+    position_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """把 RoPE 应用到 query 和 key 上。
 
     RoPE 是 Rotary Position Embedding，中文常叫“旋转位置编码”。它会按 token
     位置给 query/key 的成对维度做旋转。和 learned absolute position embedding
     不同，RoPE 不是把位置向量直接加到 token embedding 上，而是把位置信息注入
     attention 的 q/k 计算里，因此在 LLaMA 风格架构中很常见。
+
+    position_offset 表示当前 token 在整段上下文中的起始位置。
+    这在 KV cache 推理时很重要：decode 阶段一次只输入一个新 token，但它的
+    实际位置不再是 0，而是“历史长度”。
 
     输入形状：
         q, k: (B, n_head, T, head_dim)
@@ -77,7 +86,7 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, theta: float) -> tuple[torch.Te
     if head_dim % 2 != 0:
         raise ValueError("RoPE requires an even attention head dimension")
 
-    positions = torch.arange(seq_len, device=q.device, dtype=torch.float32)
+    positions = torch.arange(position_offset, position_offset + seq_len, device=q.device, dtype=torch.float32)
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=q.device, dtype=torch.float32) / head_dim))
     freqs = torch.outer(positions, inv_freq)
     cos = freqs.cos().to(dtype=q.dtype)[None, None, :, :]
@@ -124,7 +133,26 @@ class CausalSelfAttention(nn.Module):
         mask = torch.tril(torch.ones(config.block_size, config.block_size))
         self.register_buffer("causal_mask", mask.view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        position_offset: int = 0,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """执行注意力计算，并在需要时返回新的 KV cache。
+
+        past_kv:
+            历史 key/value 缓存，形状分别是 (B, n_head, T_past, head_dim)。
+
+        use_cache:
+            是否返回当前层新的 cache。训练时为 False；生成时通常为 True。
+
+        position_offset:
+            当前输入 token 在整段上下文中的起始位置。对 RoPE 和 learned position
+            embedding 都很重要，因为 decode 阶段输入很短，但位置并不从 0 开始。
+        """
+
         batch, seq_len, embd = x.shape
 
         q, k, v = self.c_attn(x).split(embd, dim=2)
@@ -137,12 +165,25 @@ class CausalSelfAttention(nn.Module):
         v = v.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
 
         if self.use_rope:
-            q, k = apply_rope(q, k, self.rope_theta)
+            q, k = apply_rope(q, k, self.rope_theta, position_offset=position_offset)
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=-2)
+            v = torch.cat((past_v, v), dim=-2)
+
+        present_kv = (k, v) if use_cache else None
+        total_len = k.size(-2)
 
         # attention score 是 query 和 key 的缩放点积。
         # 除以 sqrt(head_dim) 可以避免 logits 过大，让 softmax 更稳定。
         scores = (q @ k.transpose(-2, -1)) * (self.head_dim**-0.5)
-        scores = scores.masked_fill(self.causal_mask[:, :, :seq_len, :seq_len] == 0, float("-inf"))
+
+        # 训练时通常没有 past_kv，直接取左上角的标准下三角 mask。
+        # 使用 KV cache 时，当前 q 对应的是“靠后的位置”，所以要从大 mask 中
+        # 取出 [position_offset : position_offset + seq_len] 这一段行。
+        mask = self.causal_mask[:, :, position_offset : position_offset + seq_len, :total_len]
+        scores = scores.masked_fill(mask == 0, float("-inf"))
         weights = F.softmax(scores, dim=-1)
         weights = self.attn_dropout(weights)
 
@@ -150,7 +191,7 @@ class CausalSelfAttention(nn.Module):
         out = weights @ v
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, embd)
         out = self.resid_dropout(self.c_proj(out))
-        return out
+        return out, present_kv
 
 
 class MLP(nn.Module):
@@ -205,10 +246,22 @@ class Block(nn.Module):
         self.ln_2 = build_norm(config)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        position_offset: int = 0,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        attn_out, present_kv = self.attn(
+            self.ln_1(x),
+            past_kv=past_kv,
+            use_cache=use_cache,
+            position_offset=position_offset,
+        )
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, present_kv
 
 
 class MiniGPT(nn.Module):
@@ -247,6 +300,66 @@ class MiniGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _forward_impl(
+        self,
+        idx: torch.Tensor,
+        past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None] | None]:
+        """模型内部前向逻辑，供训练和 KV cache 推理共用。
+
+        训练时：
+            past_kv=None, use_cache=False
+
+        推理时：
+            prefill 阶段把整段 prompt 输入进来，建立每一层的 cache
+            decode 阶段每次只输入新 token，并把 cache 传回来复用
+        """
+
+        batch, seq_len = idx.shape
+        if past_kv is None:
+            past_kv = [None] * len(self.blocks)
+        if len(past_kv) != len(self.blocks):
+            raise ValueError("past_kv length must match number of blocks")
+
+        past_length = 0
+        if past_kv and past_kv[0] is not None:
+            past_length = past_kv[0][0].size(-2)
+
+        if past_length + seq_len > self.config.block_size:
+            raise ValueError(
+                f"context length {past_length + seq_len} exceeds block_size {self.config.block_size}"
+            )
+
+        tok_emb = self.token_embedding(idx)
+        if self.position_embedding is None:
+            x = self.dropout(tok_emb)
+        else:
+            positions = torch.arange(
+                past_length,
+                past_length + seq_len,
+                dtype=torch.long,
+                device=idx.device,
+            )
+            pos_emb = self.position_embedding(positions)
+            x = self.dropout(tok_emb + pos_emb)
+
+        present_kv = [] if use_cache else None
+        for block, layer_past in zip(self.blocks, past_kv):
+            x, layer_present = block(
+                x,
+                past_kv=layer_past,
+                use_cache=use_cache,
+                position_offset=past_length,
+            )
+            if use_cache:
+                assert present_kv is not None
+                present_kv.append(layer_present)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits, present_kv
+
     def forward(
         self,
         idx: torch.Tensor,
@@ -263,23 +376,7 @@ class MiniGPT(nn.Module):
             loss: 如果传入 targets，则返回 cross entropy loss，否则为 None
         """
 
-        batch, seq_len = idx.shape
-        if seq_len > self.config.block_size:
-            raise ValueError(f"sequence length {seq_len} exceeds block_size {self.config.block_size}")
-
-        tok_emb = self.token_embedding(idx)
-        if self.position_embedding is None:
-            x = self.dropout(tok_emb)
-        else:
-            positions = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
-            pos_emb = self.position_embedding(positions)
-            x = self.dropout(tok_emb + pos_emb)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
+        logits, _ = self._forward_impl(idx, past_kv=None, use_cache=False)
 
         loss = None
         if targets is not None:
@@ -289,21 +386,69 @@ class MiniGPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
+    def forward_with_kv_cache(
+        self,
+        idx: torch.Tensor,
+        past_kv: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor] | None]]:
+        """推理专用前向：返回 logits 和更新后的 KV cache。
+
+        KV cache 的直觉是：
+        - K = key
+        - V = value
+        - 旧 token 的 k/v 在后续 decode 时不会变，所以可以缓存下来
+        - 新 token 来时，只算它自己的 q/k/v，然后直接和历史 cache 拼起来用
+
+        这样就避免了“每生成 1 个 token，就把整个上下文再算一遍”的重复工作。
+        """
+
+        logits, present_kv = self._forward_impl(idx, past_kv=past_kv, use_cache=True)
+        assert present_kv is not None
+        return logits, present_kv
+
+    @torch.no_grad()
     def generate(
         self,
         idx: torch.Tensor,
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        use_kv_cache: bool = True,
     ) -> torch.Tensor:
-        """自回归生成：每次预测一个新 token，并把它拼回上下文继续预测。"""
+        """自回归生成：每次预测一个新 token，并把它拼回上下文继续预测。
+
+        use_kv_cache=False:
+            每一步都重算当前整段上下文，代码最直观，但重复计算很多。
+
+        use_kv_cache=True:
+            prompt 先做一次 prefill，建立 cache；之后 decode 阶段每次只输入一个
+            新 token，并复用历史 key/value。
+        """
 
         self.eval()
+        if not use_kv_cache:
+            for _ in range(max_new_tokens):
+                # 模型最多只能看 block_size 个上下文 token。prompt 很长时，只保留
+                # 最近的上下文窗口，这也是 GPT 类模型推理时常见的处理方式。
+                idx_cond = idx[:, -self.config.block_size :]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :] / max(temperature, 1e-6)
+
+                if top_k is not None:
+                    values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < values[:, [-1]]] = -float("inf")
+
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, next_id), dim=1)
+            return idx
+
+        # prefill：先把整段 prompt 走一遍，得到最后一个位置的 logits 和每一层缓存。
+        idx_cond = idx[:, -self.config.block_size :]
+        idx = idx_cond
+        logits, past_kv = self.forward_with_kv_cache(idx_cond)
+
         for _ in range(max_new_tokens):
-            # 模型最多只能看 block_size 个上下文 token。prompt 很长时，只保留
-            # 最近的上下文窗口，这也是 GPT 类模型推理时常见的处理方式。
-            idx_cond = idx[:, -self.config.block_size :]
-            logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / max(temperature, 1e-6)
 
             if top_k is not None:
@@ -313,6 +458,16 @@ class MiniGPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, next_id), dim=1)
+
+            # 如果 cache 还没装满 block_size，decode 阶段只需要输入一个新 token。
+            # 如果已经达到窗口上限，就按“最近 block_size 个 token”重建一次 cache。
+            # 这样可以保持与无 cache 路径相同的最近窗口语义。
+            cache_len = past_kv[0][0].size(-2) if past_kv and past_kv[0] is not None else 0
+            if cache_len >= self.config.block_size:
+                idx_window = idx[:, -self.config.block_size :]
+                logits, past_kv = self.forward_with_kv_cache(idx_window)
+            else:
+                logits, past_kv = self.forward_with_kv_cache(next_id, past_kv=past_kv)
 
         return idx
 

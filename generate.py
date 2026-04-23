@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--disable_kv_cache", action="store_true")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     return parser.parse_args()
 
@@ -52,11 +53,14 @@ def main() -> None:
     prompt_ids = tokenizer.encode(args.prompt)
     x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
+    # 默认开启 KV cache。这样 prompt 只需要 prefill 一次，后续 decode 阶段
+    # 每次只计算新 token，而不是把整段上下文反复重算。
     y = model.generate(
         x,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        use_kv_cache=not args.disable_kv_cache,
     )
     print(tokenizer.decode(y[0].tolist()))
 

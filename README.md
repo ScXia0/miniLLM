@@ -63,6 +63,12 @@ python train.py --architecture llama --max_steps 300 --block_size 64 --batch_siz
 python generate.py --prompt "To build" --max_new_tokens 200
 ```
 
+关闭 KV cache，对比慢速生成路径：
+
+```bash
+python generate.py --prompt "To build" --max_new_tokens 200 --disable_kv_cache
+```
+
 如果你在 Apple Silicon 上，默认会自动尝试使用 `mps`；有 NVIDIA GPU 时会自动使用 `cuda`；否则使用 `cpu`。
 
 ## 从 0 跑通完整流程
@@ -188,6 +194,7 @@ python3 generate.py \
 - `--max_new_tokens`：最多生成多少个新 token
 - `--temperature`：采样随机性，越低越保守，越高越发散
 - `--top_k`：只从概率最高的 k 个 token 里采样
+- `--disable_kv_cache`：关闭 KV cache，回到“每步重算整段上下文”的教学路径
 
 ### 7. 换成你自己的训练语料
 
@@ -428,7 +435,67 @@ prompt -> 预测 next token -> 拼回输入 -> 再预测下一个 token -> ...
 
 `top_k` 只允许模型从概率最高的 k 个 token 中采样，可以减少很离谱的输出。
 
-### 7. 训练优化
+### 7. KV Cache
+
+文件：`minillm/model.py`
+
+这一版实现已经加入了教学版 KV cache。
+
+**为什么需要 KV cache**
+
+没有 KV cache 时，生成流程是：
+
+```text
+prompt
+-> 算整段上下文的 attention
+-> 生成 1 个新 token
+-> 把新 token 拼回去
+-> 再把整段上下文重算一遍
+```
+
+这样做最大的问题是：旧 token 的 key/value 每一步都在重复计算。
+
+有 KV cache 时：
+
+```text
+prefill: 先把 prompt 完整跑一遍，缓存每层的 K/V
+decode: 之后每次只输入 1 个新 token，直接复用历史 K/V
+```
+
+所以 KV cache 的核心直觉是：
+
+```text
+旧 token 的 K/V 不变，就不要重复算
+```
+
+**这一版代码里的实现层次**
+
+- `CausalSelfAttention`：支持传入 `past_kv`，并返回新的 `present_kv`
+- `Block`：把每层 attention 的 cache 往上层传
+- `MiniGPT.forward_with_kv_cache()`：推理专用前向，返回 logits 和整模型的 cache
+- `MiniGPT.generate()`：默认开启 KV cache，也保留了关闭 cache 的慢速路径
+
+**Prefill 和 Decode**
+
+- `prefill`：把整段 prompt 输入模型，建立所有层的 KV cache
+- `decode`：后续每一步只输入最新生成的 1 个 token
+
+这是理解真实 LLM 推理延迟的关键切分。
+
+**为什么还要处理 block_size 上限**
+
+当前模型和旧实现一样，只保留最近的 `block_size` 个 token 作为上下文窗口。  
+所以当缓存长度达到窗口上限后，代码会用“最近窗口”重建一次 cache，保证语义和
+原来“每次都截取最近窗口重算”的实现一致。
+
+你可以直接对比两条生成命令：
+
+```bash
+python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenizer.json --prompt "To build" --max_new_tokens 200
+python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenizer.json --prompt "To build" --max_new_tokens 200 --disable_kv_cache
+```
+
+### 8. 训练优化
 
 文件：`train.py`
 
@@ -489,15 +556,42 @@ out/
 - 训练 step
 - 最后一次 train/val loss
 
+## 面试问题
+
+这一步实现完之后，你可以比较自然地回答这些问题：
+
+1. 什么是 KV cache，它缓存了什么？
+   - 缓存的是每一层 attention 的 key/value，不是整个 hidden state。
+
+2. 为什么 KV cache 能加速推理？
+   - 因为旧 token 的 K/V 在后续 decode 中不会变，不需要重复计算。
+
+3. 为什么训练时一般不用 KV cache？
+   - 训练时要并行处理整段序列，重点是一次性算完所有位置；KV cache 更适合自回归生成阶段。
+
+4. prefill 和 decode 有什么区别？
+   - prefill 输入整段 prompt，建立缓存；decode 每步只输入 1 个 token。
+
+5. KV cache 的代价是什么？
+   - 更省算力，但会占显存/内存，因为要保存每层每个历史 token 的 K/V。
+
+6. 为什么上下文越长，KV cache 占用越大？
+   - 因为历史 token 越多，要缓存的 K/V 张量就越长。
+
+7. 如果上下文超过 block size 怎么办？
+   - 当前实现按最近窗口重建 cache，保持和原始最近窗口语义一致。
+
+8. KV cache 和 tokenizer 有什么关系？
+   - tokenizer 影响序列长度；BPE 往往让 token 更少，因此同样文本下 KV cache 也更省。
+
 ## 你可以怎么继续扩展
 
 建议按这个顺序升级：
 
 1. 把教学版 BPE 升级成 byte-level BPE，减少未知字符问题
-2. 加入 KV cache，让生成更快
-3. 加入 grouped-query attention，理解 GQA/MQA
-4. 加入 LoRA，做参数高效微调
-5. 加入简单 eval benchmark，比如困惑度、QA 准确率
-6. 写一个 C 或 C++ 推理器，理解权重导出和部署
+2. 加入 grouped-query attention，理解 GQA/MQA
+3. 加入 LoRA，做参数高效微调
+4. 加入简单 eval benchmark，比如困惑度、QA 准确率
+5. 写一个 C 或 C++ 推理器，理解权重导出和部署
 
 这条路线会从 nanoGPT 逐渐走向 LLaMA-style mini model，也会覆盖很多面试里常问的 LLM 工程点。
