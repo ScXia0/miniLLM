@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_layer", type=int, default=4)
     parser.add_argument("--n_head", type=int, default=4)
     parser.add_argument("--n_embd", type=int, default=128)
+    parser.add_argument("--architecture", type=str, default="gpt", choices=["gpt", "llama"])
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
@@ -118,6 +119,26 @@ def build_optimizer(model: MiniGPT, learning_rate: float, weight_decay: float) -
     return torch.optim.AdamW(optim_groups, lr=learning_rate)
 
 
+def architecture_options(name: str) -> dict[str, str | float]:
+    """Translate a friendly architecture name into model component choices."""
+
+    if name == "gpt":
+        return {
+            "norm_type": "layernorm",
+            "mlp_type": "gelu",
+            "position_embedding_type": "learned",
+            "rope_theta": 10000.0,
+        }
+    if name == "llama":
+        return {
+            "norm_type": "rmsnorm",
+            "mlp_type": "swiglu",
+            "position_embedding_type": "rope",
+            "rope_theta": 10000.0,
+        }
+    raise ValueError(f"unknown architecture: {name}")
+
+
 def cosine_lr(step: int, max_steps: int, base_lr: float) -> float:
     """A tiny cosine schedule: high learning rate early, gentle decay later."""
 
@@ -179,6 +200,7 @@ def main() -> None:
     tokenizer_path = out_dir / "tokenizer.json"
     tokenizer.save(tokenizer_path)
 
+    arch_options = architecture_options(args.architecture)
     model_cfg = GPTConfig(
         vocab_size=tokenizer.vocab_size,
         block_size=args.block_size,
@@ -186,6 +208,7 @@ def main() -> None:
         n_head=args.n_head,
         n_embd=args.n_embd,
         dropout=args.dropout,
+        **arch_options,
     )
     model = MiniGPT(model_cfg).to(device)
     optimizer = build_optimizer(model, args.learning_rate, args.weight_decay)
@@ -194,6 +217,11 @@ def main() -> None:
     effective_batch_tokens = args.batch_size * args.block_size * args.gradient_accumulation_steps
 
     print(f"device: {device}")
+    print(f"architecture: {args.architecture}")
+    print(
+        "components: "
+        f"{model_cfg.norm_type}, {model_cfg.mlp_type}, {model_cfg.position_embedding_type}"
+    )
     print(f"mixed precision: {'on' if use_amp else 'off'} ({amp_dtype})")
     print(f"vocab_size: {tokenizer.vocab_size}")
     print(f"train tokens: {len(train_data)}, val tokens: {len(val_data)}")
@@ -261,6 +289,7 @@ def main() -> None:
             "dtype": args.dtype,
             "amp_dtype": str(amp_dtype),
             "use_amp": use_amp,
+            "architecture": args.architecture,
         },
     }
     ckpt_path = out_dir / "model.pt"

@@ -6,7 +6,12 @@
 文本语料 -> tokenizer -> token ids -> batch -> Transformer -> loss -> 反向传播 -> checkpoint -> 自回归生成
 ```
 
-当前版本参考 nanoGPT 的思路，实现了一个 **char-level decoder-only Transformer**。char-level tokenizer 很简单，但好处是透明：你可以直接看到字符如何变成整数，整数如何进入模型，模型又如何预测下一个字符。
+当前版本参考 nanoGPT 的思路，实现了一个 **char-level decoder-only Transformer**。模型支持两种架构配置：
+
+- `--architecture gpt`：GPT-2 风格，LayerNorm + GELU MLP + learned position embedding
+- `--architecture llama`：LLaMA 风格，RMSNorm + SwiGLU + RoPE
+
+char-level tokenizer 很简单，但好处是透明：你可以直接看到字符如何变成整数，整数如何进入模型，模型又如何预测下一个字符。
 
 ## 文件结构
 
@@ -34,7 +39,13 @@ pip install -r requirements.txt
 用默认小语料训练一个玩具模型：
 
 ```bash
-python train.py --max_steps 300 --block_size 64 --batch_size 16
+python train.py --architecture gpt --max_steps 300 --block_size 64 --batch_size 16
+```
+
+训练一个 LLaMA-style 玩具模型：
+
+```bash
+python train.py --architecture llama --max_steps 300 --block_size 64 --batch_size 16
 ```
 
 生成文本：
@@ -116,6 +127,7 @@ python3 generate.py \
 
 ```bash
 python3 train.py \
+  --architecture gpt \
   --max_steps 300 \
   --block_size 64 \
   --batch_size 16 \
@@ -129,6 +141,7 @@ python3 train.py \
 参数含义：
 
 - `--max_steps`：训练多少步
+- `--architecture`：模型结构，`gpt` 或 `llama`
 - `--block_size`：上下文长度，也就是每次看多少个 token
 - `--batch_size`：每个 microbatch 训练多少段文本
 - `--gradient_accumulation_steps`：累积多少个 microbatch 后再更新一次参数
@@ -177,6 +190,7 @@ data/my_corpus.txt
 ```bash
 python3 train.py \
   --data_path data/my_corpus.txt \
+  --architecture llama \
   --max_steps 1000 \
   --block_size 128 \
   --batch_size 32 \
@@ -232,7 +246,7 @@ python3 train.py --device cuda --dtype auto --max_steps 300
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 train.py --max_steps 300 --block_size 64 --batch_size 16 --gradient_accumulation_steps 2 --out_dir out/demo
+python3 train.py --architecture llama --max_steps 300 --block_size 64 --batch_size 16 --gradient_accumulation_steps 2 --out_dir out/demo
 python3 generate.py --checkpoint out/demo/model.pt --tokenizer out/demo/tokenizer.json --prompt "To build" --max_new_tokens 200
 ```
 
@@ -295,7 +309,45 @@ x = x + mlp(layer_norm(x))
 
 这里使用的是 pre-norm 结构，训练小模型时更稳定，也更接近现代 GPT/LLaMA 系模型的常见写法。
 
-### 4. Causal Self-Attention
+### 4. GPT-style vs LLaMA-style
+
+文件：`minillm/model.py`
+
+当前代码可以用 `--architecture` 在两种结构之间切换。
+
+**GPT-style**
+
+```bash
+python3 train.py --architecture gpt
+```
+
+组件组合：
+
+```text
+LayerNorm + GELU MLP + learned position embedding
+```
+
+这更接近 GPT-2 / nanoGPT 的教学结构，直观、经典、容易理解。
+
+**LLaMA-style**
+
+```bash
+python3 train.py --architecture llama
+```
+
+组件组合：
+
+```text
+RMSNorm + SwiGLU + RoPE
+```
+
+这些组件更接近现代开源 LLM 的常见结构：
+
+- `RMSNorm`：不做均值中心化，只按 root mean square 归一化，结构更简单
+- `SwiGLU`：带门控的 MLP，比普通 GELU MLP 表达能力更强
+- `RoPE`：把位置信息旋转进 query/key，而不是直接加 learned position embedding
+
+### 5. Causal Self-Attention
 
 普通 self-attention 会让每个位置看到所有 token。但语言模型训练时，位置 `i` 不能看到未来的 token，否则它就作弊了。
 
@@ -310,7 +362,7 @@ x = x + mlp(layer_norm(x))
 
 这就是 decoder-only GPT 能进行自回归生成的关键。
 
-### 5. 自回归生成
+### 6. 自回归生成
 
 文件：`generate.py`
 
@@ -327,7 +379,7 @@ prompt -> 预测 next token -> 拼回输入 -> 再预测下一个 token -> ...
 
 `top_k` 只允许模型从概率最高的 k 个 token 中采样，可以减少很离谱的输出。
 
-### 6. 训练优化
+### 7. 训练优化
 
 文件：`train.py`
 
@@ -393,14 +445,10 @@ out/
 建议按这个顺序升级：
 
 1. 把 char tokenizer 换成 BPE tokenizer
-2. 把 learned position embedding 换成 RoPE
-3. 把 LayerNorm 换成 RMSNorm
-4. 把 GELU MLP 换成 SwiGLU
-5. 加入 KV cache，让生成更快
-6. 加入 gradient accumulation，模拟更大 batch size
-7. 加入 mixed precision，学习 fp16/bf16 训练
-8. 加入 LoRA，做参数高效微调
-9. 加入简单 eval benchmark，比如困惑度、QA 准确率
-10. 写一个 C 或 C++ 推理器，理解权重导出和部署
+2. 加入 KV cache，让生成更快
+3. 加入 grouped-query attention，理解 GQA/MQA
+4. 加入 LoRA，做参数高效微调
+5. 加入简单 eval benchmark，比如困惑度、QA 准确率
+6. 写一个 C 或 C++ 推理器，理解权重导出和部署
 
 这条路线会从 nanoGPT 逐渐走向 LLaMA-style mini model，也会覆盖很多面试里常问的 LLM 工程点。

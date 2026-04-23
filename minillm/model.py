@@ -1,4 +1,4 @@
-"""A compact nanoGPT-style decoder-only Transformer.
+"""A compact decoder-only Transformer with GPT-style and LLaMA-style options.
 
 This file intentionally keeps the architecture explicit. The goal is not to
 hide complexity behind a framework, but to expose the exact components that show
@@ -25,6 +25,73 @@ class GPTConfig:
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.1
+    norm_type: str = "layernorm"
+    mlp_type: str = "gelu"
+    position_embedding_type: str = "learned"
+    rope_theta: float = 10000.0
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square LayerNorm, used by LLaMA-style models.
+
+    LayerNorm subtracts the mean and divides by the standard deviation. RMSNorm
+    skips the mean subtraction and normalizes by root mean square instead. It is
+    a little simpler, a little cheaper, and widely used in modern decoder-only
+    LLMs such as LLaMA.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Compute the normalization in fp32 for numerical stability, then cast
+        # back to the incoming dtype so mixed precision still saves memory.
+        normed = x.float() * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return self.weight.to(dtype=x.dtype) * normed.to(dtype=x.dtype)
+
+
+def build_norm(config: GPTConfig) -> nn.Module:
+    """Create the normalization layer selected by the config."""
+
+    if config.norm_type == "layernorm":
+        return nn.LayerNorm(config.n_embd)
+    if config.norm_type == "rmsnorm":
+        return RMSNorm(config.n_embd)
+    raise ValueError(f"unknown norm_type: {config.norm_type}")
+
+
+def apply_rope(q: torch.Tensor, k: torch.Tensor, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply Rotary Position Embeddings to query and key tensors.
+
+    RoPE rotates pairs of hidden dimensions by an angle that depends on token
+    position. Unlike learned absolute position embeddings, RoPE injects position
+    information inside attention itself, which is why it appears in many modern
+    LLaMA-style architectures.
+
+    Input shapes:
+        q, k: (B, n_head, T, head_dim)
+    """
+
+    seq_len = q.size(-2)
+    head_dim = q.size(-1)
+    if head_dim % 2 != 0:
+        raise ValueError("RoPE requires an even attention head dimension")
+
+    positions = torch.arange(seq_len, device=q.device, dtype=torch.float32)
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=q.device, dtype=torch.float32) / head_dim))
+    freqs = torch.outer(positions, inv_freq)
+    cos = freqs.cos().to(dtype=q.dtype)[None, None, :, :]
+    sin = freqs.sin().to(dtype=q.dtype)[None, None, :, :]
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        x_rotated = torch.stack((x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1)
+        return x_rotated.flatten(start_dim=-2)
+
+    return rotate(q), rotate(k)
 
 
 class CausalSelfAttention(nn.Module):
@@ -43,6 +110,10 @@ class CausalSelfAttention(nn.Module):
 
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
+        self.use_rope = config.position_embedding_type == "rope"
+        self.rope_theta = config.rope_theta
+        if self.use_rope and self.head_dim % 2 != 0:
+            raise ValueError("RoPE requires n_embd / n_head to be even")
 
         # One projection produces q, k, and v together for efficiency.
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
@@ -66,6 +137,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq_len, self.n_head, self.head_dim).transpose(1, 2)
 
+        if self.use_rope:
+            q, k = apply_rope(q, k, self.rope_theta)
+
         # Attention scores are scaled dot products between queries and keys.
         # Dividing by sqrt(head_dim) keeps logits numerically well-behaved.
         scores = (q @ k.transpose(-2, -1)) * (self.head_dim**-0.5)
@@ -85,15 +159,32 @@ class MLP(nn.Module):
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd),
-            nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd),
-            nn.Dropout(config.dropout),
-        )
+        self.mlp_type = config.mlp_type
+        if config.mlp_type == "gelu":
+            self.net = nn.Sequential(
+                nn.Linear(config.n_embd, 4 * config.n_embd),
+                nn.GELU(),
+                nn.Linear(4 * config.n_embd, config.n_embd),
+                nn.Dropout(config.dropout),
+            )
+        elif config.mlp_type == "swiglu":
+            # SwiGLU is the gated MLP family used by LLaMA. It computes
+            # down_proj(silu(gate_proj(x)) * up_proj(x)). The elementwise gate
+            # gives the MLP a multiplicative interaction, which tends to work
+            # better than a plain GELU feed-forward block at LLM scale.
+            hidden_dim = 4 * config.n_embd
+            self.gate_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.up_proj = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+            self.dropout = nn.Dropout(config.dropout)
+        else:
+            raise ValueError(f"unknown mlp_type: {config.mlp_type}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        if self.mlp_type == "gelu":
+            return self.net(x)
+        gated = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        return self.dropout(self.down_proj(gated))
 
 
 class Block(nn.Module):
@@ -109,9 +200,9 @@ class Block(nn.Module):
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = build_norm(config)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = build_norm(config)
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -128,10 +219,16 @@ class MiniGPT(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        if config.position_embedding_type == "learned":
+            self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        elif config.position_embedding_type == "rope":
+            self.position_embedding = None
+        else:
+            raise ValueError(f"unknown position_embedding_type: {config.position_embedding_type}")
+
         self.dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.ln_f = build_norm(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Weight tying: input token embeddings and output classifier weights
@@ -171,10 +268,13 @@ class MiniGPT(nn.Module):
         if seq_len > self.config.block_size:
             raise ValueError(f"sequence length {seq_len} exceeds block_size {self.config.block_size}")
 
-        positions = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
         tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(positions)
-        x = self.dropout(tok_emb + pos_emb)
+        if self.position_embedding is None:
+            x = self.dropout(tok_emb)
+        else:
+            positions = torch.arange(0, seq_len, dtype=torch.long, device=idx.device)
+            pos_emb = self.position_embedding(positions)
+            x = self.dropout(tok_emb + pos_emb)
 
         for block in self.blocks:
             x = block(x)
@@ -222,4 +322,3 @@ class MiniGPT(nn.Module):
         """Return the number of trainable parameters."""
 
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
