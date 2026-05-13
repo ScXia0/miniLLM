@@ -25,22 +25,22 @@ from typing import ContextManager
 import torch
 
 from minillm.data import BatchConfig, get_batch, read_text, split_train_val
-from minillm.model import GPTConfig, MiniGPT
+from minillm.model import ModelConfig, MiniGPT
 from minillm.tokenizer import train_tokenizer
 
-
+# 读训练参数
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train miniLLM")
     parser.add_argument("--data_path", type=str, default="data/sample.txt")
     parser.add_argument("--out_dir", type=str, default="out")
     parser.add_argument("--tokenizer", type=str, default="char", choices=["char", "bpe"])
     parser.add_argument("--bpe_vocab_size", type=int, default=256)
-    parser.add_argument("--block_size", type=int, default=64)
+    parser.add_argument("--block_size", type=int, default=64) # 样本长度
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--n_layer", type=int, default=4)
     parser.add_argument("--n_head", type=int, default=4)
     parser.add_argument("--n_embd", type=int, default=128)
-    parser.add_argument("--architecture", type=str, default="gpt", choices=["gpt", "llama"])
+    parser.add_argument("--architecture", type=str, default="gpt", choices=["gpt", "llama"]) # gpt/llama
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
@@ -51,10 +51,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_iters", type=int, default=20)
     parser.add_argument("--val_fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"]) # 跑在 cpu/cuda/mps
     return parser.parse_args()
 
-
+# 设备和精度选择
 def pick_device(name: str) -> torch.device:
     """选择训练设备；如果没有 GPU/MPS，就回退到最通用的 CPU。"""
 
@@ -63,7 +63,6 @@ def pick_device(name: str) -> torch.device:
     if name == "mps" or (name == "auto" and torch.backends.mps.is_available()):
         return torch.device("mps")
     return torch.device("cpu")
-
 
 def pick_autocast_dtype(device: torch.device, dtype_name: str) -> tuple[torch.dtype, bool]:
     """选择 automatic mixed precision 使用的 dtype。
@@ -179,18 +178,28 @@ def main() -> None:
     if args.gradient_accumulation_steps < 1:
         raise ValueError("--gradient_accumulation_steps must be >= 1")
 
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed) # 固定随机种子，方便复现
 
+    # 定义输出目录，后面 checkpoint 和 tokenizer 都存这里
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = pick_device(args.device)
-    amp_dtype, use_amp = pick_autocast_dtype(device, args.dtype)
+    amp_dtype, use_amp = pick_autocast_dtype(device, args.dtype) # 决定要不要开 mixed precision
 
     text = read_text(args.data_path)
+    # 构建文字分词："hello" -> ["h", "e", "l", "l", "o"]
     tokenizer = train_tokenizer(text, args.tokenizer, args.bpe_vocab_size)
+    # 把分词后文本变成一长串整数id：["h", "e", "l", "l", "o"] -> [7, 4, 10, 10, 13]
     ids = tokenizer.encode(text)
     train_data, val_data = split_train_val(ids, args.val_fraction)
 
+    # 长度检验
+    '''
+        防止一个很常见的问题：
+        需要切出长度为 block_size 的 x
+        需要切出右移一位的 y
+        数据太短就没法构造样本
+    '''
     min_required = args.block_size + 2
     if len(train_data) < min_required or len(val_data) < min_required:
         raise ValueError(
@@ -201,18 +210,34 @@ def main() -> None:
     tokenizer_path = out_dir / "tokenizer.json"
     tokenizer.save(tokenizer_path)
 
+    # 把你输入的“架构名字”翻译成具体实现选项
+    '''
+    举例如下：
+    if: 
+        --architecture gpt
+    then:
+        norm_type = layernorm
+        mlp_type = gelu
+        position_embedding_type = learned
+    elif:
+        --architecture llama
+    then:
+        norm_type = rmsnorm
+        mlp_type = swiglu
+        position_embedding_type = rope
+    '''
     arch_options = architecture_options(args.architecture)
-    model_cfg = GPTConfig(
-        vocab_size=tokenizer.vocab_size,
-        block_size=args.block_size,
+    model_cfg = ModelConfig(
+        vocab_size=tokenizer.vocab_size, # vocab_size 必须和 tokenizer 对齐，因为模型需要给当前位置的下一个 token 打分，所以词表多少token就要输出多少个分数
+        block_size=args.block_size, # 数据侧：每条训练样本长度是多少；模型侧：模型一次最多能看多长上下文
         n_layer=args.n_layer,
         n_head=args.n_head,
-        n_embd=args.n_embd,
+        n_embd=args.n_embd, # 隐层维度：n_embd=128，那每个 token 进模型后都会变成一个长度 128 的向量
         dropout=args.dropout,
         **arch_options,
     )
-    model = MiniGPT(model_cfg).to(device)
-    optimizer = build_optimizer(model, args.learning_rate, args.weight_decay)
+    model = MiniGPT(model_cfg).to(device) # ModelConfig：图纸；MiniGPT(...)：按图纸造出来的模型实体
+    optimizer = build_optimizer(model, args.learning_rate, args.weight_decay) # 模型负责算“错了多少”，优化器负责根据这个错误去改参数
     batch_cfg = BatchConfig(batch_size=args.batch_size, block_size=args.block_size, device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda" and amp_dtype == torch.float16))
     effective_batch_tokens = args.batch_size * args.block_size * args.gradient_accumulation_steps
@@ -235,34 +260,47 @@ def main() -> None:
     last_log_time = start_time
     last_log_step = 0
     last_eval = {}
-    for step in range(1, args.max_steps + 1):
-        lr = cosine_lr(step, args.max_steps, args.learning_rate)
+    for step in range(1, args.max_steps + 1): # if --max_steps 1000 then 做 1000 次参数更新流程；每个step：拿一批样本、算一次梯度、更新一次模型参数
+        lr = cosine_lr(step, args.max_steps, args.learning_rate) # 动态调整学习率：前快后漫
         for group in optimizer.param_groups:
             group["lr"] = lr
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True) # 清空旧梯度，否则叠加
         micro_losses = []
+        # 梯度累积：显存不够装一个大 batch，那就把大 batch 拆成几小份，梯度先攒着，最后统一更新
+        '''
+        if：
+            --max_steps 100
+            --gradient_accumulation_steps: 4
+            --batch_size: 1000
+        then:
+            不马上每个 batch 都更新参数，而是连续算 4 个 microbatch 的梯度(过了4*1000=4000条样本)，
+            把它们加起来，最后一起更新一次参数，一共更新100次参数，一共过4000 * 100=400000条样本
+        '''
         for micro_step in range(args.gradient_accumulation_steps):
-            x, y = get_batch(train_data, batch_cfg)
+            x, y = get_batch(train_data, batch_cfg) # 给定 x，预测 y：x: 当前 token 序列、y: 下一个 token 序列
             with autocast_context(device, amp_dtype, use_amp):
-                _, loss = model(x, y)
+                _, loss = model(x, y) # 模型内部会：算出每个位置对下一个 token 的预测分数 logits，再拿 logits 和 y 算交叉熵损失 loss
                 assert loss is not None
                 # gradient accumulation（梯度累积）会把多个 microbatch 的梯度累加
                 # 后再更新一次参数。这里除以累积步数，是为了让最终梯度尺度等价于
                 # 直接使用一个更大的 batch。
-                scaled_loss = loss / args.gradient_accumulation_steps
+                scaled_loss = loss / args.gradient_accumulation_steps # 梯度因为累计会放大4倍，所以每个梯度都小一些
+                # 先算 loss，再根据 loss 反向传播，得到梯度，再用梯度更新参数
+                # 如果我在下山，loss说明现在有多糟，梯度说明现在该往哪里走
 
             micro_losses.append(loss.item())
-            scaler.scale(scaled_loss).backward()
+            scaler.scale(scaled_loss).backward() # 反向传播：根据 loss，沿着计算图一路往回算每个参数的梯度，为了让 loss 下降，知道每个参数应该往哪个方向改、改多少
 
         # mixed precision 下，GradScaler 可能会放大梯度以避免 fp16 下溢。
         # 做 gradient clipping（梯度裁剪）前必须先 unscale，否则裁剪阈值会作用在
         # 被人为放大的梯度上。
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # 梯度太大时裁一下，防止训练发散
+        scaler.step(optimizer) # 相当于optimizer.step()：更新参数
         scaler.update()
 
+        # 定期评估
         if step == 1 or step % args.eval_interval == 0 or step == args.max_steps:
             last_eval = estimate_loss(model, train_data, val_data, batch_cfg, args.eval_iters, amp_dtype, use_amp)
             now = time.time()

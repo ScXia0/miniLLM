@@ -11,7 +11,7 @@ from pathlib import Path
 
 import torch
 
-from minillm.model import GPTConfig, MiniGPT
+from minillm.model import ModelConfig, MiniGPT
 from minillm.tokenizer import load_tokenizer
 
 
@@ -44,7 +44,7 @@ def main() -> None:
 
     # checkpoint 保存了模型权重和模型结构配置，生成时必须二者都恢复。
     checkpoint = torch.load(args.checkpoint, map_location=device)
-    config = GPTConfig(**checkpoint["model_config"])
+    config = ModelConfig(**checkpoint["model_config"])
     model = MiniGPT(config).to(device)
     model.load_state_dict(checkpoint["model_state"])
 

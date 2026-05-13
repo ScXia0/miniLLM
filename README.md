@@ -21,12 +21,19 @@ tokenizer 支持两种实现：
 ```text
 miniLLM/
 ├── data/sample.txt          # 一个很小的示例训练语料
+├── data/sft_sample.jsonl    # 一个很小的示例 SFT 数据集
+├── data/dpo_sample.jsonl    # 一个很小的示例 DPO 偏好数据集
 ├── minillm/
 │   ├── data.py              # 读取文本、切分 train/val、构造 next-token batch
-│   ├── model.py             # GPTConfig、CausalSelfAttention、Block、MiniGPT
-│   └── tokenizer.py         # CharTokenizer 和 BPETokenizer
+│   ├── model.py             # ModelConfig、CausalSelfAttention、Block、MiniGPT
+│   ├── tokenizer.py         # CharTokenizer 和 BPETokenizer
+│   ├── sft_data.py          # chat template、SFT 样本编码、answer-only loss mask
+│   └── dpo_data.py          # DPO 偏好样本编码、chosen/rejected batch
 ├── train.py                 # 训练入口
+├── sft.py                   # SFT 训练入口
+├── dpo.py                   # DPO 训练入口
 ├── generate.py              # 文本生成入口
+├── sft_generate.py          # SFT 模型的聊天式生成入口
 ├── requirements.txt
 └── README.md
 ```
@@ -68,6 +75,78 @@ python generate.py --prompt "To build" --max_new_tokens 200
 ```bash
 python generate.py --prompt "To build" --max_new_tokens 200 --disable_kv_cache
 ```
+
+训练一个最小 SFT 模型：
+
+```bash
+python sft.py --data_path data/sft_sample.jsonl --tokenizer char --architecture gpt --max_steps 200 --block_size 128 --batch_size 8
+```
+
+更接近真实 LLM 流程的做法，是先 pretrain 再 SFT。当前版本也支持这一点：
+
+```bash
+python train.py --data_path data/sample.txt --out_dir out/base --max_steps 300
+python sft.py --data_path data/sft_sample.jsonl --init_checkpoint out/base/model.pt --out_dir out/sft-from-base --max_steps 200
+```
+
+这时 `sft.py` 会直接继承 base checkpoint 的：
+
+- tokenizer
+- model_config
+- model_state
+
+从而更贴近真实的：
+
+```text
+random init -> pretrain -> base checkpoint -> SFT
+```
+
+用 SFT 模型做一轮简单聊天生成：
+
+```bash
+python sft_generate.py --checkpoint out/sft/model.pt --tokenizer out/sft/tokenizer.json --user "北京是中国的什么？"
+```
+
+如果你想继续做偏好对齐（DPO），可以在 SFT checkpoint 基础上继续训练：
+
+```bash
+python dpo.py \
+  --data_path data/dpo_sample.jsonl \
+  --init_checkpoint out/sft/model.pt \
+  --out_dir out/dpo \
+  --max_steps 200
+```
+
+这时：
+
+- policy model 会继续训练
+- reference model 会冻结，作为“初始偏好参照物”
+- 训练目标不再是单条 answer 的交叉熵，而是让 chosen 相对 rejected 更占优
+
+如果你先做了 DPO，那么 DPO checkpoint 也可以继续用同一个 `sft_generate.py` 来做聊天生成，因为它同样保存了：
+
+- tokenizer_path
+- model_config
+- chat_template
+
+如果你想走参数高效微调（LoRA）路线，可以在 SFT 时打开：
+
+```bash
+python sft.py \
+  --data_path data/sft_sample.jsonl \
+  --init_checkpoint out/base/model.pt \
+  --out_dir out/sft-lora \
+  --lora_rank 8 \
+  --lora_alpha 16 \
+  --lora_dropout 0.05 \
+  --lora_target_modules attn
+```
+
+这时：
+
+- base model 权重会被冻结
+- 只训练注意力层里的 LoRA 小矩阵
+- 训练日志里会同时打印 `trainable parameters` 和 `total parameters`
 
 如果你在 Apple Silicon 上，默认会自动尝试使用 `mps`；有 NVIDIA GPU 时会自动使用 `cuda`；否则使用 `cpu`。
 
@@ -537,6 +616,48 @@ python3 train.py --device mps --dtype float16
 **Tokens/sec**
 
 训练日志里会显示 `tok/s`，也就是每秒处理多少 token。相比只看 step 时间，tokens/sec 更适合比较不同 batch size、context length 和模型大小下的训练效率。
+
+## SFT 路线
+
+当前仓库已经额外提供了一条 **监督微调（SFT）** 路线，用来把基础 next-token 模型继续训练成更像聊天助手的形式。
+
+这条路线的核心文件是：
+
+- [sft.py](/Users/didi/Documents/miniLLM/sft.py)
+- [sft_generate.py](/Users/didi/Documents/miniLLM/sft_generate.py)
+- [minillm/sft_data.py](/Users/didi/Documents/miniLLM/minillm/sft_data.py)
+
+这版实现刻意采用了一个很透明的教学方案：
+
+1. 先用模板文本表达 special tokens  
+   例如：
+
+   ```text
+   <bos><system>...<user>...<assistant>...<eos>
+   ```
+
+   这样你能直接看到 chat template 是如何把结构化对话样本线性化的。
+
+2. 不修改现有 tokenizer 主逻辑  
+   我们没有一上来就实现 tokenizer-native special token id，而是先把这些边界标记当成模板字符串参与 tokenizer 训练和编码。这样更容易观察：
+
+   - tokenizer 看到的到底是什么
+   - prompt 和 answer 在 token 序列里如何排列
+
+3. 用 `-100` 做 answer-only supervision  
+   SFT 里最关键的一点是：prompt 部分只提供条件，不参与监督。  
+   在代码里，这通过把 prompt 位置的 label 写成 `-100` 完成；`cross_entropy(ignore_index=-100)` 会自动跳过这些位置。
+
+你可以把这条路线理解成：
+
+```text
+结构化对话样本
+-> chat template
+-> tokenizer.encode
+-> input_ids + labels(-100 mask)
+-> model(x, y)
+-> 只对 assistant answer 部分算 loss
+```
 
 ## 训练产物
 
